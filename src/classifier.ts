@@ -4,6 +4,8 @@ import { resolveParentUris, recordSeenPost } from './parent-resolver';
 import { Dimension, Sentiment, InquiryType } from './categories';
 import { DeweyClass } from './dewey';
 import { shouldRunLLM } from './embedding';
+import { scoreResearchURLs, hasStrongResearchURL } from './research-urls';
+import { detectStance, isStanceGateEnabled } from './stance-detector';
 
 const USE_LLM = (process.env.USE_LLM_CLASSIFIER ?? 'false') === 'true';
 const RESEARCH_LLM_THRESHOLD = parseFloat(process.env.RESEARCH_LLM_THRESHOLD ?? '1.0');
@@ -51,6 +53,14 @@ export async function classifyPost(post: PostEvent): Promise<ClassifyResult> {
     const linkedUris = [post.parentUri, post.rootUri, post.quotedUri]
       .filter((u): u is string => typeof u === 'string');
     if (linkedUris.length > 0) {
+      // allowFetch is COST CONTROL, not classification. It decides whether
+      // to spend an external Bluesky AppView call resolving the parent
+      // post. Keyword signals are useful here as a cheap "is this post
+      // promising enough to bother resolving its context?" check, since
+      // making this fetch on every reply would significantly increase
+      // AppView traffic and worsen rate limits. This is the one place
+      // keyword flags still have decision power in the pipeline, and it's
+      // bounded to API-cost decisions, not match decisions.
       const allowFetch =
         v.keywordCritical || v.keywordPraise || v.keywordInquiry ||
         v.weakPraiseHint || v.weakInquiryHint ||
@@ -70,8 +80,19 @@ export async function classifyPost(post: PostEvent): Promise<ClassifyResult> {
 
   if (!hasResearchContext) return emptyResult();
 
-  const totalAdjacency = v.researchScore + inheritedScore;
+  // Compute research-URL boost: presence of DOI / arXiv / OpenReview / etc.
+  // is a strong structural signal that this post is research engagement, so
+  // we add a tier-based bonus to the adjacency score. CANONICAL and
+  // PROCEEDINGS URLs add 3.0; INSTITUTIONAL adds 1.5. This pushes posts
+  // with research-source URLs well above the worthLLM threshold and also
+  // enables the stance-gate override below.
+  const allUrls = [...post.urls, ...(viaParent ? [] : [])];
+  const urlBoost = scoreResearchURLs(allUrls);
+  const totalAdjacency = v.researchScore + inheritedScore + urlBoost.boost;
   const baseSignals = [...inheritedSignals, ...v.signals];
+  if (urlBoost.tier !== 'none') {
+    baseSignals.push(`url_tier:${urlBoost.tier}`, ...urlBoost.matched.map((m) => `url:${m}`));
+  }
   const threadRoot = post.rootUri ?? post.parentUri ?? post.uri;
 
   // ---------- Path A: Strong keyword evidence (skip LLM call) ----------
@@ -132,61 +153,72 @@ export async function classifyPost(post: PostEvent): Promise<ClassifyResult> {
     return emptyResult();
   }
 
-  // With LLM enabled, fast-path obvious critiques/praise; inquiry always goes to LLM
-  // (too easy to false-positive without the model's judgment).
-  if (strongKeywordCritique) {
-    return buildResult({
-      sentiment: 'critical', inquiryType: null,
-      adjacency: totalAdjacency,
-      keywordHits: v.critiqueHits.length,
-      dimensions: v.critiqueDimensions,
-      baseSignals, viaParent, deweyClass, threadRoot,
-      classifier: 'keyword',
-    });
-  }
-  if (strongKeywordPraise) {
-    return buildResult({
-      sentiment: 'praise', inquiryType: null,
-      adjacency: totalAdjacency,
-      keywordHits: v.praiseHits.length,
-      dimensions: v.praiseDimensions,
-      baseSignals, viaParent, deweyClass, threadRoot,
-      classifier: 'keyword',
-    });
-  }
-
-  // ---------- Path B: LLM call ----------
+  // ---------- Path B: LLM is the primary judge ----------
+  //
+  // Gating decision: which posts are worth an LLM call?
+  //
+  // Once research-adjacency is established, the LLM gets to decide. We
+  // gate based on adjacency strength only, with two structural fast-paths:
+  //   - Meta-critique posts (norm/ethics discussion) qualify regardless
+  //     of adjacency because they may not cite any paper at all
+  //   - Posts with strong research URLs (DOI / arXiv / OpenReview) qualify
+  //     regardless of adjacency, because the URL is overwhelming evidence
+  //
+  // Keyword flags (v.keywordCritical etc.) are INTENTIONALLY OMITTED from
+  // this decision. Keywords still feed the LLM via the `signals` array,
+  // but they don't get to gate worth-LLM on their own. Earlier alpha
+  // observation: keyword-only gating yielded ~10/10 false positives. The
+  // URL classifier (research-urls.ts) plus the embedding pre-filter
+  // together do a much better job of catching real research engagement.
+  //
+  // Cost: this widens the gate slightly (a few posts pass via the URL
+  // tier that previously would've been gated by keyword flags). The
+  // stance gate and full LLM filter downstream, so cost increase is
+  // bounded and the precision improves.
   const worthLLM =
     totalAdjacency >= RESEARCH_LLM_THRESHOLD ||
     v.isMetaCritique ||
-    v.keywordCritical || v.keywordPraise || v.keywordInquiry ||
-    v.weakPraiseHint || v.weakInquiryHint;
+    urlBoost.tier !== 'none';
 
   if (!worthLLM) return emptyResult();
 
   // Embedding pre-filter
   const embedDecision = await shouldRunLLM(post.text);
   if (embedDecision.enabled && !embedDecision.worthLLM) {
-    if (v.keywordCritical) {
-      return buildResult({
-        sentiment: 'critical', inquiryType: null,
-        adjacency: totalAdjacency,
-        keywordHits: v.critiqueHits.length,
-        dimensions: v.critiqueDimensions,
-        baseSignals: [...baseSignals, `embed_skip:nei=${embedDecision.bestNeither.toFixed(2)}`],
-        viaParent, deweyClass, threadRoot,
-        classifier: 'keyword',
-      });
+    // Strong research URL is a structural override. A post with a DOI or
+    // arXiv link is unlikely to be off-topic noise even if the embedding
+    // pre-filter says no, so we let it through to the full classifier.
+    if (!hasStrongResearchURL(allUrls)) {
+      return emptyResult();
     }
-    return emptyResult();
   }
   const embedSignals = embedDecision.enabled
     ? [`embed:crit=${embedDecision.bestCritique.toFixed(2)},praise=${embedDecision.bestPraise.toFixed(2)},nei=${embedDecision.bestNeither.toFixed(2)}`]
     : [];
 
+  // Stance gate (Phase B): a cheap LLM call asking just "ENGAGE / ANNOUNCE
+  // / TANGENTIAL / OFF_TOPIC". Drops posts that read as dissemination or
+  // off-topic banter before we spend tokens on the full classifier. The
+  // CANONICAL / PROCEEDINGS URL override applies here too: if the post has
+  // a DOI / arXiv / OpenReview link, we send it to the full LLM regardless
+  // of stance, because the URL is strong structural evidence.
+  let stanceSignal: string | null = null;
+  if (isStanceGateEnabled()) {
+    const stance = await detectStance(post.text);
+    stanceSignal = `stance:${stance}`;
+    const isStrongURL = hasStrongResearchURL(allUrls);
+    if ((stance === 'TANGENTIAL' || stance === 'OFF_TOPIC') && !isStrongURL) {
+      return emptyResult();
+    }
+    if (stance === 'ANNOUNCE' && !isStrongURL) {
+      return emptyResult();
+    }
+  }
+  const stanceSignals = stanceSignal ? [stanceSignal] : [];
+
   try {
     const { llmClassify } = await import('./llm-classify');
-    const out = await llmClassify(post.text, [...baseSignals, ...embedSignals]);
+    const out = await llmClassify(post.text, [...baseSignals, ...embedSignals, ...stanceSignals]);
 
     const threshold =
       out.sentiment === 'praise' ? LLM_PRAISE_CONFIDENCE_THRESHOLD :
@@ -194,18 +226,9 @@ export async function classifyPost(post: PostEvent): Promise<ClassifyResult> {
       LLM_CONFIDENCE_THRESHOLD;
 
     if (out.sentiment === 'neither' || out.confidence < threshold) {
-      // Fall back ONLY to keyword-critique (never to keyword-praise/inquiry
-      // alone, which the LLM has effectively rejected as insufficient).
-      if (v.keywordCritical) {
-        return buildResult({
-          sentiment: 'critical', inquiryType: null,
-          adjacency: totalAdjacency,
-          keywordHits: v.critiqueHits.length,
-          dimensions: v.critiqueDimensions,
-          baseSignals, viaParent, deweyClass, threadRoot,
-          classifier: 'keyword',
-        });
-      }
+      // High-precision mode: if the LLM says "neither" or low-confidence,
+      // we trust it. No keyword fallback — keywords are signals, not
+      // decision-makers when the LLM is the primary judge.
       return emptyResult();
     }
 
@@ -239,17 +262,11 @@ export async function classifyPost(post: PostEvent): Promise<ClassifyResult> {
       llmConfidence: out.confidence,
     });
   } catch (e) {
+    // LLM call failed (network, rate limit, etc.). In high-precision mode
+    // we drop the post rather than fall back to keyword-only. Worst case
+    // is we miss a real match while the LLM is unavailable; best case is
+    // we don't pollute the feed with low-confidence guesses.
     console.error('[llm] error', e);
-    if (v.keywordCritical) {
-      return buildResult({
-        sentiment: 'critical', inquiryType: null,
-        adjacency: totalAdjacency,
-        keywordHits: v.critiqueHits.length,
-        dimensions: v.critiqueDimensions,
-        baseSignals, viaParent, deweyClass, threadRoot,
-        classifier: 'keyword',
-      });
-    }
     return emptyResult();
   }
 }
