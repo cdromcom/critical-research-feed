@@ -1,0 +1,35 @@
+{
+  "name": "critical-research-feed",
+  "version": "0.1.0-alpha",
+  "description": "A Bluesky custom feed surfacing substantive engagement with research reports across disciplines.",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "publish-feed": "tsx src/publish.ts",
+    "test:dewey": "node test/dewey.smoke.js",
+    "seed-exemplars": "tsx -e \"require('./src/embedding').seedExemplars()\""
+  },
+  "dependencies": {
+    "@atproto/api": "^0.13.0",
+    "openai": "^4.65.0",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
